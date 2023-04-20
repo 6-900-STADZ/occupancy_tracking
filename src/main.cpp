@@ -18,14 +18,14 @@
 #define WIFI_CHANNEL_MAX               (13)
 
 // if a device hasn't been seen for greater than DEVICE_TIMEOUT, clear it
-#define DEVICE_TIMEOUT          (1000*60*5) 
-// TODO: might raise this threshold to -50 or -55
+#define DEVICE_TIMEOUT          (1000*60*2) 
 // device is considered "in range" if it's RSSI is at or above this
 #define BLE_RSSI_THRESHOLD            (-50) 
 #define WIFI_RSSI_THRESHOLD           (-55)
-#define SCANNING_TIME           (1000*60*3)
+// scan to check occupancy every 1 minute
+#define SCANNING_TIME           (1000*60*1) 
 
-// TODO: how to remove devices seen for too long
+// TODO: explore in beta, if we need to remove devices seen for too long
 
 unsigned long last_scan_time;
 void update_detected_devices();
@@ -112,6 +112,12 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
         std::string strAddrData = advertisedDevice.getAddress().toString();
 
+        // TODO: explore in beta, bringing this back but we need to account for them having much lower RSSI's -80 to -95
+        // BLEUUID ble_exposure_notification_uuid = BLEUUID("0000fd6f-0000-1000-8000-00805f9b34fb");
+        // if (advertisedDevice.isAdvertisingService(ble_exposure_notification_uuid)) {
+        //     Serial.printf("advertising covid with RSSI %d", advertisedDevice.getRSSI());
+        // }
+
         // * For testing purposes, tracks the max and min RSSI seen
         if (advertisedDevice.getRSSI() > max_RSSI || max_RSSI == 1) {
             max_RSSI = advertisedDevice.getRSSI();
@@ -120,29 +126,24 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
             min_RSSI = advertisedDevice.getRSSI();
         }
 
-        if (device_seen_before(strAddrData) == true) {
-            return;
-        }
-
-        if (advertisedDevice.getRSSI() < BLE_RSSI_THRESHOLD) {
-            // don't store device if above the top rssi threshold
+        if (device_seen_before(strAddrData) == true || advertisedDevice.getRSSI() < BLE_RSSI_THRESHOLD) {
+            // don't store device RSSI is too low or it's already stored
             return;
         }
 
         BLEDetectedDevice newDevice;
         newDevice.ble_mac_addr = strAddrData;
         newDevice.rssi = advertisedDevice.getRSSI();
+
+        // TODO: does millis reset after going into sleep overnight
         newDevice.time_first_detected = millis();
-        newDevice.time_last_detected = millis();
+        newDevice.time_last_detected = newDevice.time_first_detected;
 
         // Can be used to check if a particular service is being advertised
         BLEUUID ble_exposure_notification_uuid = BLEUUID("0000fd6f-0000-1000-8000-00805f9b34fb");
         newDevice.advertising_covid_exposure = advertisedDevice.isAdvertisingService(ble_exposure_notification_uuid);
 
         ble_detected_devices.add(newDevice);
-
-        // BLE_ADDR_PUBLIC (0x00), BLE_ADDR_RANDOM (0x01), BLE_ADDR_PUBLIC_ID (0x02), BLE_ADDR_RANDOM_ID (0x03)
-        // Serial.printf("Address Type: %zu \n", (unsigned int)advertisedDevice.getAddressType());
     }
 };
 
@@ -175,36 +176,57 @@ void update_detected_devices() {
     // Sniff Wi-Fi traffic
     wifi_sniff();
 
-    // TODO: average numbers to decide on bus stop occupancy at this time
+    // Average numbers to decide on bus stop occupancy at this time
     float wifi_factor = 0.8 * wifi_detected_devices.size(); // pulls average down to help accoutn for people with multiple devices  
-    float ble_factor = 0.5 * ble_detected_devices.size(); // pulls average down to help accoutn for people with multiple devices  
-    float ble_covid_factor = 0.5 * get_in_covid_exposure_ble_device_count();  
-    int occupancy_estimate = (wifi_factor + ble_factor + ble_covid_factor) / 3;
+    float ble_factor = 0.5 * ble_detected_devices.size(); // pulls average down to help accoutn for people with multiple devices 
+
+    // TODO: might explore in beta using this factor again in beta, but we need to account for that RSSI's tend to be low -80 to -95
+    // float ble_covid_factor = 0.5 * get_in_covid_exposure_ble_device_count();  
+    // int occupancy_estimate = (wifi_factor + ble_factor + ble_covid_factor) / 3;
+
+    int occupancy_estimate = (wifi_factor + ble_factor) / 2;
 
     // save the current believed “occupancy”
     occupancy_metrics[current_i] = occupancy_estimate;
 
-    // TODO: average device time around
-    // ? should we include near zeros in the average, might really be pulling things down
+    // Average device time around, ignores near 0 time around values (so newly found devices in this average)
     int total = 0;
+    int count = 0;
+    int max_time_around = 0;
+    // Serial.print("BLE wait times - ");
     for (int i = 0; i < ble_detected_devices.size(); i++) {
-        total += ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
+        int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
+        if (time_around > 200) {
+            total += time_around;
+            count += 1;
+            max_time_around = max(time_around, max_time_around);
+        }
+        // Serial.print((ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected)/(60.0*1000.0));
+        // Serial.print(", ");
     }
+    // Serial.print("\nWifi wait times - ");
     for (int i = 0; i < wifi_detected_devices.size(); i++) {
-        total += wifi_detected_devices.get(i).time_last_detected - wifi_detected_devices.get(i).time_first_detected;
+        int time_around = wifi_detected_devices.get(i).time_last_detected - wifi_detected_devices.get(i).time_first_detected;
+        if (time_around > 200) {
+            total += time_around;
+            count += 1;
+            max_time_around = max(time_around, max_time_around);
+        }
+        // Serial.print((wifi_detected_devices.get(i).time_last_detected - wifi_detected_devices.get(i).time_first_detected)/(60.0*1000.0));
+        // Serial.print(", ");
     }
+    // Serial.println();
 
     float average_time_around = 0.0; 
-    if (ble_detected_devices.size() + wifi_detected_devices.size() > 0) {
-        average_time_around = total / (ble_detected_devices.size() + wifi_detected_devices.size()); // in ms
+    if (count > 0) {
+        average_time_around = total / count; // in ms
     }
 
-    // TODO: save the current avg time around
-    wait_time_metric[current_i] = average_time_around;
+    // Save the current avg of the max time around with the average time around
+    wait_time_metric[current_i] = (max_time_around + average_time_around) / 2;
 
-    // update previous estimated occupancy based on count of devices that have been around for over SCANNING_TIME
+    // TODO: explore in beta update previous estimated occupancy based on count of devices that have been around for over SCANNING_TIME
     // if (current_i > 0) {
-    //     // TODO: update to match new calculation
     //     int updated_covid_ble_count = 0;
     //     int updated_detected_ble_count = 0;
     //     int updated_detected_wifi_count = 0;
@@ -243,8 +265,7 @@ void update_detected_devices() {
     // log wait time metrics to serial monitor
     Serial.print("Wait Time = ");
     for (int i = 0; i <= current_i; i++) {
-        // TODO: convert to minutes
-        Serial.printf("%0.2f, ", wait_time_metric[i]/(60*1000));
+        Serial.printf("%0.3f, ", wait_time_metric[i]/(60.0*1000.0));
     }
     Serial.println();
     
@@ -318,9 +339,6 @@ void clear_old_devices() {
             removed_count += 1;
         }
     }
-    if (removed_count != 0) {
-        Serial.printf("%d old devices removed\n", removed_count);
-    }
 }
 
 esp_err_t event_handler(void *ctx, system_event_t *event) {
@@ -337,12 +355,6 @@ void wifi_sniffer_init(void) {
   ESP_ERROR_CHECK( esp_wifi_start() );
   esp_wifi_set_promiscuous(true); // appears to turn on the wifi scanning
   esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer_packet_handler);
-
-//   CONFIG_ESP32_WIFI_TASK_PINNED_TO_CORE_0
-//   CONFIG_BT_
-
-    // TODO: Try changing filter esp_wifi_set_promiscuous_filter to WIFI_PROMIS_FILTER_MASK_ALL, see what the diff is
-    // by default it is to filter all packets except WIFI_PKT_MISC
 }
 
 void wifi_sniffer_set_channel(uint8_t channel) {
@@ -351,7 +363,7 @@ void wifi_sniffer_set_channel(uint8_t channel) {
 
 const char * wifi_sniffer_packet_type2str(wifi_promiscuous_pkt_type_t type) {
   switch(type) {
-    case WIFI_PKT_MGMT: return "MGMT"; // only ever seen this packet type so far
+    case WIFI_PKT_MGMT: return "MGMT";
     case WIFI_PKT_DATA: return "DATA";
     default:  
     case WIFI_PKT_MISC: return "MISC";
@@ -392,20 +404,17 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
         return;
     }
 
-    // Serial.printf("rssi seen %d\n", ppkt->rx_ctrl.rssi);
-
     // Add new detected device to linked list
     WiFiDetectedDevice newDevice;
     newDevice.wifi_mac_addr = mac_addr;
     newDevice.rssi = ppkt->rx_ctrl.rssi;
     newDevice.time_first_detected = millis();
-    newDevice.time_last_detected = millis();
+    newDevice.time_last_detected = newDevice.time_first_detected;
     wifi_detected_devices.add(newDevice);
 }
 
 void wifi_sniff() {
     // Init Wi-Fi Sniffer
-    delay(10); // TODO: is this needed
     wifi_sniffer_init();
 
     // Clear out old devices detected from wifi scanning that haven't been seen recently
@@ -416,12 +425,13 @@ void wifi_sniff() {
     min_RSSI = 1;
     wifi_devices_seen = 0;
 
-    // Perform wifi sniffing for 2.5 seconds per channel, 24 channels -> 60 seconds total
+    // Perform wifi sniffing for 2.5 seconds per channel, 12 channels -> 30 seconds total
+    // TODO: explore in beta, having more "popular" channels get more scanning time than others
     for (int i = 1; i < WIFI_CHANNEL_MAX; i++) {
         vTaskDelay(WIFI_CHANNEL_SWITCH_INTERVAL / portTICK_PERIOD_MS);
         wifi_sniffer_set_channel(i);
         
-        delay(2500); // TODO: change to be non-blocking
+        delay(2500);
         // Serial.printf("device count after channel %d = %d\n", i, wifi_devices_seen);
     }
     ESP_ERROR_CHECK( esp_wifi_stop() );
@@ -453,8 +463,5 @@ void clear_old_wifi_devices() {
             wifi_detected_devices.remove(i);
             removed_count += 1;
         }
-    }
-    if (removed_count != 0) {
-        Serial.printf("%d old devices removed\n", removed_count);
     }
 }
