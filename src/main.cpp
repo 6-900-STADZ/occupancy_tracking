@@ -15,39 +15,42 @@
 #include "driver/gpio.h"
 
 #define WIFI_CHANNEL_SWITCH_INTERVAL  (500)
-#define WIFI_CHANNEL_MAX               (13)
 
 // if a device hasn't been seen for greater than DEVICE_TIMEOUT, clear it
 #define DEVICE_TIMEOUT          (1000*60*4) 
 // device is considered "in range" if it's RSSI is at or above this
-#define BLE_RSSI_THRESHOLD            (-95) 
+#define BLE_RSSI_THRESHOLD            (-85) 
 #define WIFI_RSSI_THRESHOLD           (-75)
-// scan to check occupancy every 1 minute
+// scan to check occupancy every 3 minutes
 #define SCANNING_TIME           (1000*60*3)
 
 unsigned long last_scan_time;
 void update_detected_devices();
 
-int current_i = 0;
-int occupancy_metrics[250]; // 250 leaves enough space for a full day of occupancy data
+uint8_t current_i = 0;
+uint8_t occupancy_metrics[250]; // Measures occupancy 20 times an hour * 12 hours a day = 240, 250 leaves enough space for a full day of occupancy data
+// TODO: 1D array, zoe splits it on her end
+// TODO: add function to extend this array if it gets too small from 6.08
+uint8_t wait_time_metrics[2400]; // Measures wait time 20 times an hour * 12 hours a day * on avg. 10 person occupancy per time
 
 // RSSI (Received signal strength indication): measured in decibels from 0 (zero) to -120 (minus 120)
 // closer to 0 (zero) the stronger the signal, which means it's better
 
 // ** testing purposes **
-int channel = 0;
+uint8_t channel = 0;
 bool logOccupancy = true;
 bool logWifiMacAddr = false;
 bool logBLEMacAddr = false;
-bool logMacAddrSeen = false;
+bool logMacAddrSeen = true;
 unsigned long start_time;
-int ble_detected_count = 0;
-int wifi_detected_count = 0;
+uint8_t ble_detected_count = 0;
+uint8_t wifi_detected_count = 0;
+int wifi_devices_seen = 0;
 
 // -- BLE vars --
 
 // ESP32 docs - https://h2zero.github.io/esp-nimble-cpp/class_nim_b_l_e_advertised_device.html#ac1b8ff0f2897abda335743d55668fcd9
-int scanTime = 1; // seconds
+uint8_t scanTime = 1; // seconds
 BLEScan* pBLEScan;
 
 unsigned long ble_scan_start_time;
@@ -59,19 +62,18 @@ enum oui_class {
   unknown
 };
 
-// TODO: move to be its own file
 class DetectedDevice {
   public:
     std::string mac_addr;
-    int rssi;
+    int8_t rssi;
     unsigned long time_first_detected;
     unsigned long time_last_detected;
     bool advertising_covid_exposure;
     oui_class oui;
 
     // ** for testing purposes
-    int wifi_channel;
-    int pckt_addr_num;
+    uint8_t wifi_channel;
+    uint8_t pckt_addr_num;
 };
 LinkedList<DetectedDevice> ble_detected_devices;
 LinkedList<DetectedDevice> wifi_detected_devices;
@@ -79,24 +81,24 @@ LinkedList<DetectedDevice> wifi_detected_devices;
 void ble_init();
 void ble_scan_devices();
 int get_in_range_ble_device_count();
-int get_in_covid_exposure_ble_device_count();
+int get_covid_exposure_ble_device_count();
 bool device_seen_before(std::string addr, int rssi);
 void clear_old_devices();
 
 // -- Wi-Fi vars --
 // https://github.com/ESP-EOS/ESP32-WiFi-Sniffer/blob/master/WIFI_SNIFFER_ESP32.ino
 
-int wifi_devices_seen = 0;
-
 // MAC Addresses start with the manufacturer's organizationally unique identifier (OUI)
 // For occupancy tracking, important OUI's to track include the following manufacturer's
 // - Apple, Inc., Google, Inc., Samsung Electronics Co.,Ltd, Motorola Mobility LLC, a Lenovo Company, LG Electronics (Mobile Communications)
-#define IMPORTANT_MAC_OUIS_SIZE 3
+#define IMPORTANT_MAC_OUIS_SIZE 8
 #define NOT_IMPORTANT_MAC_OUIS_SIZE 3
 // amazon tech 90:a8:22, e0:f7:28
 // google f8:0f:f9 (added)
-std::string important_mac_ouis[3] = { "20:15:82", "00:25:00", "f8:0f:f9" };
-std::string not_important_mac_ouis[3] = { "00:3E:73", "d4:20:b0", "5c:5b:35" }; // mainly networking related communications
+// samsung c0:bd:c8 (added)
+// TODO: scrape for more of these values
+std::string important_mac_ouis[IMPORTANT_MAC_OUIS_SIZE] = { "20:15:82", "00:25:00", "f8:0f:f9", "68:d9:3c", "5c:e9:1e", "1c:57:dc", "c0:bd:c8", "38:f9:d3" };
+std::string not_important_mac_ouis[NOT_IMPORTANT_MAC_OUIS_SIZE] = { "00:3E:73", "d4:20:b0", "5c:5b:35" }; // mainly networking related communications
 
 void wifi_sniff();
 void clear_old_wifi_devices();
@@ -187,12 +189,15 @@ void update_detected_devices() {
     // Scan for BLE devices
     ble_scan_devices();
 
+    // ** for log testing purposes
+    Serial.print("%");
+
     // Sniff Wi-Fi traffic
     wifi_sniff();
 
     // Average numbers to decide on bus stop occupancy at this time
     float wifi_estimate = get_important_wifi_device_count() + (get_in_range_wifi_device_count() + get_not_not_important_wifi_device_count()) / 2.0;
-    float ble_estimate = (0.5 * get_in_range_ble_device_count() + 0.5 * get_in_covid_exposure_ble_device_count()) / 2.0;
+    float ble_estimate = (0.5 * get_in_range_ble_device_count() + 0.5 * get_covid_exposure_ble_device_count()) / 2.0;
 
     int occupancy_estimate = (wifi_estimate + ble_estimate) / 2;
 
@@ -201,60 +206,137 @@ void update_detected_devices() {
 
     // Store current wait times rounded to nearest 0, 3, 6 min, etc.
     // TODO: need this to be size of occupancy estimate, how to decide which devices to use tho ??
-    int wait_times[occupancy_estimate];
+    // int wait_times[occupancy_estimate];
+    // TODO: fill in wait_time_metrics
 
     // first priority is to keep important mac oui wait times
-    int cur_i = 0;
-    for (int i = 0; i < wifi_detected_devices.size(); i++) {
-        bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
-
-        if (wifi_detected_devices.get(i).oui == important && seen_in_last_scan && cur_i < occupancy_estimate) {
-            int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
-            Serial.print((time_around / (60.0*1000.0)) + 0.5);
-            wait_times[cur_i] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
-            cur_i += 1;
-        }
-    }
-
-    int num_filled_in = 0;
-    if (cur_i < occupancy_estimate) {
-        // TODO:
-        for (int i = 0; i < wifi_detected_devices.size(); i++) {
-            bool pass_rssi = wifi_detected_devices.get(i).rssi >= WIFI_RSSI_THRESHOLD;
-            if (wifi_detected_devices.get(i).oui == unknown) {
-                // unknown devices have to pass a higher RSSI threshold to be considered in range
-                pass_rssi = wifi_detected_devices.get(i).rssi >= -65;
-            }
-            bool been_around = millis() - wifi_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
-            bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
-
-            if (wifi_detected_devices.get(i).oui == not_important && pass_rssi && been_around && seen_in_last_scan && cur_i < occupancy_estimate) {
-                int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
-                wait_times[cur_i] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
-                cur_i += 1;
-            }
-        }
-
-        // TODO: do more testing, to decide how to average and consolidate wait times down to total based on occupancy estimate
-        for (int i = cur_i; i < occupancy_estimate; i++) {
-            wait_times[cur_i] = 0;
-            num_filled_in += 1;
-        }
-    }
-
     // int cur_i = 0;
-    // for (int i = 0; i < ble_detected_devices.size(); i++) {
-    //     if (ble_detected_devices.get(i).rssi >= BLE_RSSI_THRESHOLD) {
+    // for (int i = 0; i < wifi_detected_devices.size(); i++) {
+    //     bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
+
+    //     if (wifi_detected_devices.get(i).oui == important && seen_in_last_scan && cur_i < occupancy_estimate) {
     //         int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
+    //         Serial.print((time_around / (60.0*1000.0)) + 0.5);
     //         wait_times[cur_i] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
     //         cur_i += 1;
     //     }
     // }
 
-    // for (int i = 0; i < wifi_detected_devices.size(); i++) {
-    //     int time_around = wifi_detected_devices.get(i).time_last_detected - wifi_detected_devices.get(i).time_first_detected;
-    //     wait_times[i + get_in_range_ble_device_count()] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+    // int num_filled_in = 0;
+    // if (cur_i < occupancy_estimate) {
+    //     // TODO:
+    //     for (int i = 0; i < wifi_detected_devices.size(); i++) {
+    //         bool pass_rssi = wifi_detected_devices.get(i).rssi >= WIFI_RSSI_THRESHOLD;
+    //         if (wifi_detected_devices.get(i).oui == unknown) {
+    //             // unknown devices have to pass a higher RSSI threshold to be considered in range
+    //             pass_rssi = wifi_detected_devices.get(i).rssi >= -65;
+    //         }
+    //         bool been_around = millis() - wifi_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
+    //         bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
+
+    //         if (wifi_detected_devices.get(i).oui == not_important && pass_rssi && been_around && seen_in_last_scan && cur_i < occupancy_estimate) {
+    //             int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
+    //             wait_times[cur_i] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+    //             cur_i += 1;
+    //         }
+    //     }
+
+    //     // TODO: do more testing, to decide how to average and consolidate wait times down to total based on occupancy estimate
+    //     for (int i = cur_i; i < occupancy_estimate; i++) {
+    //         wait_times[cur_i] = 0;
+    //         num_filled_in += 1;
+    //     }
     // }
+
+    // ** for testing, log wait times of ble and wifi separate
+    uint8_t ble_in_range_wait_times[get_in_range_ble_device_count()];
+    int cur_i_ble_in_range = 0;
+    uint8_t ble_covid_wait_times[get_covid_exposure_ble_device_count()];
+    int cur_i_ble_covid = 0;
+    for (int i = 0; i < ble_detected_devices.size(); i++) {
+        // for device to be considered in range, it must meet the RSSI threshold, have been around for more than 2.5 minutes, and seen recently
+        bool pass_rssi = ble_detected_devices.get(i).rssi >= BLE_RSSI_THRESHOLD;
+        bool been_around = millis() - ble_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
+        bool seen_in_last_scan = ble_detected_devices.get(i).time_last_detected >= ble_scan_start_time;
+
+        int time_around = ble_detected_devices.get(i).time_last_detected - ble_detected_devices.get(i).time_first_detected;
+
+        // in range
+        if (pass_rssi && been_around && seen_in_last_scan) {
+            ble_in_range_wait_times[cur_i_ble_in_range] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+            cur_i_ble_in_range += 1;
+        }
+
+        // covid device
+        if (ble_detected_devices.get(i).advertising_covid_exposure && been_around && seen_in_last_scan) {
+            ble_covid_wait_times[cur_i_ble_covid] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+            cur_i_ble_covid += 1;
+        }
+    }
+
+    uint8_t wifi_in_range_wait_times[get_in_range_wifi_device_count()];
+    int cur_i_wifi_in_range = 0;
+    uint8_t wifi_important_wait_times[get_important_wifi_device_count()];
+    int cur_i_wifi_important = 0;
+    uint8_t wifi_not_not_important_wait_times[get_not_not_important_wifi_device_count()];
+    int cur_i_wifi_not_not_important = 0;
+    for (int i = 0; i < wifi_detected_devices.size(); i++) {
+        // for device to be considered in range, it must meet the RSSI threshold, have been around for more than 2.5 minutes, and seen recently
+        bool pass_rssi = wifi_detected_devices.get(i).rssi >= WIFI_RSSI_THRESHOLD;
+        if (wifi_detected_devices.get(i).oui == unknown) {
+            // unknown devices have to pass a higher RSSI threshold to be considered in range
+            pass_rssi = wifi_detected_devices.get(i).rssi >= -65;
+        }
+        bool been_around = millis() - wifi_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
+        bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
+
+        int time_around = wifi_detected_devices.get(i).time_last_detected - wifi_detected_devices.get(i).time_first_detected;
+                
+        if (pass_rssi && been_around && seen_in_last_scan) {
+            wifi_in_range_wait_times[cur_i_wifi_in_range] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+            cur_i_wifi_in_range += 1;
+        }
+
+        if (wifi_detected_devices.get(i).oui == important && seen_in_last_scan) {
+            wifi_important_wait_times[cur_i_wifi_important] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+            cur_i_wifi_important += 1;
+        }
+
+        if (wifi_detected_devices.get(i).oui == not_important && pass_rssi && been_around && seen_in_last_scan) {
+            wifi_not_not_important_wait_times[cur_i_wifi_not_not_important] = (time_around / (60.0*1000.0)) + 0.5; // plus 0.5 is for rounding
+            cur_i_wifi_not_not_important += 1;
+        }
+    }
+
+    Serial.print("BLE In Range Wait Times = ");
+    for (int i = 0; i < cur_i_ble_in_range; i++) {
+        Serial.printf("%d, ", ble_in_range_wait_times[i]);
+    }
+    Serial.println();
+
+    Serial.print("BLE Covid Wait Times = ");
+    for (int i = 0; i < cur_i_ble_covid; i++) {
+        Serial.printf("%d, ", ble_covid_wait_times[i]);
+    }
+    Serial.println();
+
+    Serial.print("Wi-Fi In Range Wait Times = ");
+    for (int i = 0; i < cur_i_wifi_in_range; i++) {
+        Serial.printf("%d, ", wifi_in_range_wait_times[i]);
+    }
+    Serial.println();
+
+    Serial.print("Wi-Fi Important Wait Times = ");
+    for (int i = 0; i < cur_i_wifi_important; i++) {
+        Serial.printf("%d, ", wifi_important_wait_times[i]);
+    }
+    Serial.println();
+
+    Serial.print("Wi-Fi Not Not Important Wait Times = ");
+    for (int i = 0; i < cur_i_wifi_not_not_important; i++) {
+        Serial.printf("%d, ", wifi_not_not_important_wait_times[i]);
+    }
+    Serial.println();
 
     // log occupancy metrics to serial monitor
     // Serial.print("Occupancy Over Time = ");
@@ -264,11 +346,11 @@ void update_detected_devices() {
     // Serial.println();
 
     // log wait time metrics to serial monitor
-    Serial.print("Current Wait Times = ");
-    for (int i = 0; i < occupancy_estimate; i++) {
-        Serial.printf("%d, ", wait_times[i]);
-    }
-    Serial.println();
+    // Serial.print("Current Wait Times = ");
+    // for (int i = 0; i < occupancy_estimate; i++) {
+    //     Serial.printf("%d, ", wait_times[i]);
+    // }
+    // Serial.println();
 
     if (logOccupancy) {
         int current_time = millis() - start_time;
@@ -335,7 +417,7 @@ void ble_scan_devices() {
 
     if (logOccupancy) {
         int current_time = millis() - start_time;
-        Serial.printf("*[TIME=%0.3f, DEVICES_FOUND=%d, DEVICES_STORED=%d, IN_RANGE_COUNT=%d, COVID_COUNT=%d]\n", current_time / (60.0*1000.0), foundDevices.getCount(), ble_detected_devices.size(), get_in_range_ble_device_count(), get_in_covid_exposure_ble_device_count());
+        Serial.printf("*[TIME=%0.3f, DEVICES_FOUND=%d, DEVICES_STORED=%d, IN_RANGE_COUNT=%d, COVID_COUNT=%d]\n", current_time / (60.0*1000.0), foundDevices.getCount(), ble_detected_devices.size(), get_in_range_ble_device_count(), get_covid_exposure_ble_device_count());
     }
 
     // Delete results fromBLEScan buffer to release memory
@@ -358,7 +440,7 @@ int get_in_range_ble_device_count() {
     return count;
 }
 
-int get_in_covid_exposure_ble_device_count() {
+int get_covid_exposure_ble_device_count() {
     int count = 0;
     for (int i = 0; i < ble_detected_devices.size(); i++) {
         bool been_around = millis() - ble_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
@@ -505,54 +587,54 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
 
     // Looks at sender address in packet
-    // if (mac_addr.compare("ff:ff:ff:ff:ff:ff") != 0 && !sniffed_device_before(destination_addr, ppkt->rx_ctrl.rssi)) {
-    //     // * For testing purposes to see how many devices are being sniffed
-    //     wifi_devices_seen += 1;
+    if (destination_addr.compare("ff:ff:ff:ff:ff:ff") != 0 && !sniffed_device_before(destination_addr, ppkt->rx_ctrl.rssi)) {
+        // * For testing purposes to see how many devices are being sniffed
+        wifi_devices_seen += 1;
 
-    //     if (ppkt->rx_ctrl.rssi < WIFI_RSSI_THRESHOLD) {
-    //         // don't store device if above the top rssi threshold
-    //         return;
-    //     }
+        if (ppkt->rx_ctrl.rssi < WIFI_RSSI_THRESHOLD) {
+            // don't store device if above the top rssi threshold
+            return;
+        }
 
-    //     // Add new detected device to linked list
-    //     DetectedDevice newDevice;
-    //     newDevice.mac_addr = destination_addr;
-    //     newDevice.rssi = ppkt->rx_ctrl.rssi;
-    //     newDevice.time_first_detected = millis();
-    //     newDevice.time_last_detected = newDevice.time_first_detected;
-    //     newDevice.oui = get_mac_addr_oui_class(destination_addr);
+        // Add new detected device to linked list
+        DetectedDevice newDevice;
+        newDevice.mac_addr = destination_addr;
+        newDevice.rssi = ppkt->rx_ctrl.rssi;
+        newDevice.time_first_detected = millis();
+        newDevice.time_last_detected = newDevice.time_first_detected;
+        newDevice.oui = get_mac_addr_oui_class(destination_addr);
 
-    //     // ** for testing purposes
-    //     newDevice.wifi_channel = ppkt->rx_ctrl.channel;
-    //     newDevice.pckt_addr_num = 1;
+        // ** for testing purposes
+        newDevice.wifi_channel = ppkt->rx_ctrl.channel;
+        newDevice.pckt_addr_num = 1;
 
-    //     wifi_detected_devices.add(newDevice);
-    // }
+        wifi_detected_devices.add(newDevice);
+    }
 
-    // // Looks at sender address in packet
-    // if (mac_addr.compare("ff:ff:ff:ff:ff:ff") != 0 && !sniffed_device_before(filtering_addr, ppkt->rx_ctrl.rssi)) {
-    //     // * For testing purposes to see how many devices are being sniffed
-    //     wifi_devices_seen += 1;
+    // Looks at sender address in packet
+    if (filtering_addr.compare("ff:ff:ff:ff:ff:ff") != 0 && !sniffed_device_before(filtering_addr, ppkt->rx_ctrl.rssi)) {
+        // * For testing purposes to see how many devices are being sniffed
+        wifi_devices_seen += 1;
 
-    //     if (ppkt->rx_ctrl.rssi < WIFI_RSSI_THRESHOLD) {
-    //         // don't store device if above the top rssi threshold
-    //         return;
-    //     }
+        if (ppkt->rx_ctrl.rssi < WIFI_RSSI_THRESHOLD) {
+            // don't store device if above the top rssi threshold
+            return;
+        }
 
-    //     // Add new detected device to linked list
-    //     DetectedDevice newDevice;
-    //     newDevice.mac_addr = filtering_addr;
-    //     newDevice.rssi = ppkt->rx_ctrl.rssi;
-    //     newDevice.time_first_detected = millis();
-    //     newDevice.time_last_detected = newDevice.time_first_detected;
-    //     newDevice.oui = get_mac_addr_oui_class(filtering_addr);
+        // Add new detected device to linked list
+        DetectedDevice newDevice;
+        newDevice.mac_addr = filtering_addr;
+        newDevice.rssi = ppkt->rx_ctrl.rssi;
+        newDevice.time_first_detected = millis();
+        newDevice.time_last_detected = newDevice.time_first_detected;
+        newDevice.oui = get_mac_addr_oui_class(filtering_addr);
 
-    //     // ** for testing purposes
-    //     newDevice.wifi_channel = ppkt->rx_ctrl.channel;
-    //     newDevice.pckt_addr_num = 3;
+        // ** for testing purposes
+        newDevice.wifi_channel = ppkt->rx_ctrl.channel;
+        newDevice.pckt_addr_num = 3;
 
-    //     wifi_detected_devices.add(newDevice);
-    // }
+        wifi_detected_devices.add(newDevice);
+    }
 }
 
 void wifi_sniff() {
@@ -569,15 +651,15 @@ void wifi_sniff() {
     wifi_sniffer_init();
 
     // Perform wifi sniffing for 2.5 seconds per channel, 12 channels -> 30 seconds total
-    // TODO: explore in beta, having more "popular" channels get more scanning time than others
-    for (int i = 1; i < WIFI_CHANNEL_MAX; i++) {
+    // TODO: explore in beta, having more "popular" channels (1, 6, and 11) get more scanning time than others
+    // uint8_t time_per_channel[12] = {3, 1, 1, 1, 1, 3, 1, 1, 1, 1, 3};
+    for (int i = 1; i <= 11; i++) {
         vTaskDelay(WIFI_CHANNEL_SWITCH_INTERVAL / portTICK_PERIOD_MS);
         wifi_sniffer_set_channel(i);
         channel = i;
         
-        // delay(2500);
         delay(1500);
-        // Serial.printf("device count after channel %d = %d\n", i, wifi_devices_seen);
+        // delay(time_per_channel[i-1] * 1000);
     }
     ESP_ERROR_CHECK( esp_wifi_stop() );
 
@@ -586,7 +668,7 @@ void wifi_sniff() {
 
     if (logOccupancy) {
         int current_time = millis() - start_time;
-        Serial.printf("#[TIME=%0.3f, WIFI_TOTAL_COUNT=%d, DEVICES_STORED=%d", current_time/(60.0*1000.0), wifi_devices_seen, wifi_detected_devices.size());
+        Serial.printf("\n#[TIME=%0.3f, WIFI_TOTAL_COUNT=%d, DEVICES_STORED=%d", current_time/(60.0*1000.0), wifi_devices_seen, wifi_detected_devices.size());
         Serial.printf(", WIFI_IN_RANGE=%d, WIFI_DO_CARE=%d, WIFI_NOT_DO_NOT_CARE=%d]\n", get_in_range_wifi_device_count(), get_important_wifi_device_count(), get_not_not_important_wifi_device_count());
     }
 }
@@ -625,14 +707,11 @@ int get_not_not_important_wifi_device_count() {
     for (int i = 0; i < wifi_detected_devices.size(); i++) {
         bool pass_rssi = wifi_detected_devices.get(i).rssi >= WIFI_RSSI_THRESHOLD;
         if (wifi_detected_devices.get(i).oui == unknown) {
-            // unknown devices have to pass a higher RSSI threshold to be considered in range
-            // Serial.print("unknown device rssi is ");
-            // Serial.println(wifi_detected_devices.get(i).rssi);
             pass_rssi = wifi_detected_devices.get(i).rssi >= -65;
         }
         bool been_around = millis() - wifi_detected_devices.get(i).time_first_detected >= 1000.0*60.0*2.5;
         bool seen_in_last_scan = wifi_detected_devices.get(i).time_last_detected >= wifi_scan_start_time;
-        if (wifi_detected_devices.get(i).oui == not_important && pass_rssi && been_around && seen_in_last_scan) {
+        if (wifi_detected_devices.get(i).oui != not_important && pass_rssi && been_around && seen_in_last_scan) {
             count += 1;
         }
     }
@@ -694,7 +773,8 @@ bool is_mac_addr_oui_not_important(std::string mac_addr_oui) {
 
 oui_class get_mac_addr_oui_class(std::string mac_addr) {
     mac_addr[8] = '\0';
-    // Serial.print(mac_addr.c_str());
+    Serial.print(mac_addr.c_str());
+    Serial.print(",");
     if (is_mac_addr_oui_important(mac_addr)) {
         // Serial.println(" is important");
         return important;
